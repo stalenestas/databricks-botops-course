@@ -179,7 +179,6 @@ TOOL_INFOS.append(
 class ToolCallingAgent(ChatAgent):
     """
     Class representing a tool-calling Agent
-    Compatible with Databricks Review App validation requirements.
     """
 
     def get_tool_specs(self):
@@ -187,20 +186,6 @@ class ToolCallingAgent(ChatAgent):
         Returns tool specifications in the format OpenAI expects.
         """
         return [tool_info.spec for tool_info in self._tools_dict.values()]
-    
-    def _ensure_message_compatibility(self, message: ChatAgentMessage) -> ChatAgentMessage:
-        """
-        Ensure message is compatible with all Review App schema validations.
-        """
-        # Ensure content field is present (required by ChatAgentChunkSchema and strOutputSchema)
-        if not hasattr(message, 'content') or message.content is None:
-            message.content = ""
-        
-        # Ensure id field is present
-        if not hasattr(message, 'id') or message.id is None:
-            message.id = str(uuid4())
-        
-        return message
 
     # @mlflow.trace(span_type=SpanType.TOOL)
     def execute_tool(self, tool_name: str, args: dict) -> Any:
@@ -254,36 +239,15 @@ class ToolCallingAgent(ChatAgent):
     ) -> ChatAgentResponse:
         """
         Primary function that takes a user's request and generates a response.
-        Compatible with Databricks Review App validation requirements.
         """
-        if len(messages) == 0:
-            raise ValueError(
-                "The list of `messages` passed to predict(...) must contain at least one message"
-            )
-        
-        # Add system prompt
-        all_messages = [
-            ChatAgentMessage(role="system", content=SYSTEM_PROMPT)
-        ] + messages
-        
-        response_messages = []
-        
-        try:
-            for message in self.call_and_run_tools(messages=all_messages):
-                # Ensure message compatibility with all Review App schemas
-                message = self._ensure_message_compatibility(message)
-                response_messages.append(message)
-        except Exception as e:
-            # Handle errors gracefully for playground compatibility
-            error_message = ChatAgentMessage(
-                role="assistant",
-                content=f"I encountered an error: {str(e)}",
-                id=str(uuid4())
-            )
-            response_messages.append(error_message)
-        
-        # Ensure we always return a valid ChatAgentResponse with messages array
-        # This satisfies the ChatAgentResponseSchema validation
+        # NOTE: this assumes that each chunk streamed by self.call_and_run_tools contains
+        # a full message (i.e. chunk.delta is a complete message).
+        # This is simple to implement, but you can also stream partial response messages from predict_stream,
+        # and aggregate them in predict_stream by message ID
+        response_messages = [
+            chunk.delta
+            for chunk in self.predict_stream(messages, context, custom_inputs)
+        ]
         return ChatAgentResponse(messages=response_messages)
 
     # @mlflow.trace(span_type=SpanType.AGENT)
@@ -297,41 +261,28 @@ class ToolCallingAgent(ChatAgent):
             raise ValueError(
                 "The list of `messages` passed to predict(...) must contain at least one message"
             )
-        
-        # Add system prompt
         all_messages = [
             ChatAgentMessage(role="system", content=SYSTEM_PROMPT)
         ] + messages
 
         try:
             for message in self.call_and_run_tools(messages=all_messages):
-                # Ensure message compatibility with all Review App schemas
-                message = self._ensure_message_compatibility(message)
-                
-                # Create chunk with proper delta structure
-                chunk = ChatAgentChunk(delta=message)
-                yield chunk
+                yield ChatAgentChunk(delta=message)
         except openai.BadRequestError as e:
             error_data = getattr(e, "response", {}).get("json", lambda: None)()
             if error_data and "external_model_message" in error_data:
                 external_error = error_data["external_model_message"].get("error", {})
                 if external_error.get("code") == "content_filter":
-                    error_message = ChatAgentMessage(
-                        role="assistant",
-                        content="I'm sorry, I can't respond to that request.",
-                        id=str(uuid4())
+                    yield ChatAgentChunk(
+                        messages=[
+                            ChatAgentMessage(
+                                role="assistant",
+                                content="I'm sorry, I can't respond to that request.",
+                                id=str(uuid4())
+                            )
+                        ]
                     )
-                    yield ChatAgentChunk(delta=error_message)
-                    return
             raise  # Re-raise if it's not a content filter error
-        except Exception as e:
-            # Handle other errors gracefully for playground compatibility
-            error_message = ChatAgentMessage(
-                role="assistant",
-                content=f"I encountered an error: {str(e)}",
-                id=str(uuid4())
-            )
-            yield ChatAgentChunk(delta=error_message)
 
     @backoff.on_exception(backoff.expo, openai.RateLimitError)
     def chat_completion(self, messages: List[ChatAgentMessage]) -> ChatAgentResponse:
@@ -348,66 +299,53 @@ class ToolCallingAgent(ChatAgent):
         current_msg_history = messages.copy()
         for i in range(max_iter):
             with mlflow.start_span(span_type="AGENT", name=f"iteration_{i + 1}"):
-                try:
-                    # Get an assistant response from the model, add it to the running history
-                    # and yield it to the caller
-                    # NOTE: we perform a simple non-streaming chat completions here
-                    # Use the streaming API if you'd like to additionally do token streaming
-                    # of agent output.
-                    response = self.chat_completion(messages=current_msg_history)
-                    llm_message = response.choices[0].message
-                    
-                    # Ensure content field is present (even if empty for tool calls)
-                    message_dict = llm_message.to_dict()
-                    if 'content' not in message_dict or message_dict['content'] is None:
-                        message_dict['content'] = ""
-                    
-                    assistant_message = ChatAgentMessage(**message_dict, id=str(uuid4()))
-                    assistant_message = self._ensure_message_compatibility(assistant_message)
-                    current_msg_history.append(assistant_message)
-                    yield assistant_message
+                # Get an assistant response from the model, add it to the running history
+                # and yield it to the caller
+                # NOTE: we perform a simple non-streaming chat completions here
+                # Use the streaming API if you'd like to additionally do token streaming
+                # of agent output.
+                response = self.chat_completion(messages=current_msg_history)
+                llm_message = response.choices[0].message
+                assistant_message = ChatAgentMessage(**llm_message.to_dict(), id=str(uuid4()))
+                current_msg_history.append(assistant_message)
+                tool_calls = assistant_message.tool_calls
+                if assistant_message.tool_calls:
+                    assistant_message.tool_calls = None
+                    assistant_message.content = ""
+                
+                yield assistant_message
 
-                    tool_calls = assistant_message.tool_calls
-                    if not tool_calls:
-                        return  # Stop streaming if no tool calls are needed
+                if not tool_calls:
+                    return  # Stop streaming if no tool calls are needed
 
-                    # Execute tool calls, add them to the running message history,
-                    # and yield their results as tool messages
-                    for tool_call in tool_calls:
-                        function = tool_call.function
-                        args = json.loads(function.arguments)
-                        # Cast tool result to a string, since not all tools return as string
-                        result = str(self.execute_tool(tool_name=function.name, args=args))
-                        tool_call_msg = ChatAgentMessage(
-                            role="tool", name=function.name, tool_call_id=tool_call.id, content=result, id=str(uuid4())
-                        )
-                        tool_call_msg = self._ensure_message_compatibility(tool_call_msg)
-                        current_msg_history.append(tool_call_msg)
-                        yield tool_call_msg
-                        
-                except Exception as e:
-                    # Handle errors during tool execution
-                    error_message = ChatAgentMessage(
+                # Execute tool calls, add them to the running message history,
+                # and yield their results as tool messages
+                for tool_call in tool_calls:
+                    function = tool_call.function
+                    args = json.loads(function.arguments)
+                    # Cast tool result to a string, since not all tools return as tring
+                    result = str(self.execute_tool(tool_name=function.name, args=args))
+                    tool_call_msg = ChatAgentMessage(
+                        # {"role": "assistant", "content": "Hello! It's nice to meet you. Is there something I can help you with, or would you like to chat about NYC taxi data?", "id": "fe059c9b-b8c3-4e33-8544-de92ccb64014"}]}
+                        # role="tool", 
                         role="assistant",
-                        content=f"Error during processing: {str(e)}",
+                        # name=function.name, 
+                        # tool_call_id=tool_call.id,
+                        content=result, 
                         id=str(uuid4())
                     )
-                    error_message = self._ensure_message_compatibility(error_message)
-                    yield error_message
-                    return
+                    current_msg_history.append(tool_call_msg)
+                    yield tool_call_msg
 
-        # If we reach max iterations, yield a final message
-        final_message = ChatAgentMessage(
+        yield ChatAgentMessage(
            content=f"I'm sorry, I couldn't determine the answer after trying {max_iter} times.",
            role="assistant",
            id=str(uuid4())
         )
-        final_message = self._ensure_message_compatibility(final_message)
-        yield final_message
 
 
 
 # Log the model using MLflow
-mlflow.openai.autolog()
+# mlflow.openai.autolog()
 BOT = ToolCallingAgent(llm_endpoint=LLM_ENDPOINT_NAME, tools=TOOL_INFOS)
 mlflow.models.set_model(BOT)
